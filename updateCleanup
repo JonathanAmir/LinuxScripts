@@ -1,0 +1,160 @@
+#!/bin/bash
+
+#### This script is inteded to perform a cleanup to the installer manager and run a full upgrade cycle.
+### In case an e-mail to the admin is sent, comment out the relevent function.
+
+
+
+
+
+
+# Redirect output to a log file
+exec > >(tee -a /var/log/update_cleanup.log) 2>&1
+
+# Ensure the script runs as root
+if [[ $EUID -ne 0 ]]; then
+   echo "$(date): ERROR - This script must be run as root."
+   exit 1
+fi
+
+echo "$(date): Starting system update and cleanup process..."
+
+# Email settings
+ADMIN_EMAIL="admin@example.com"
+LOG_FILE="/var/log/update_cleanup.log"
+HOSTNAME=$(hostname)
+
+# Function to check command execution
+check_success() {
+    if [[ $? -ne 0 ]]; then
+        echo "$(date): ERROR - $1 failed! Exiting."
+        exit 1
+    fi
+}
+
+# Function to check SMTP package installation
+prerequisiteChecks() {
+    echo "$(date): Checking prerequisites..."
+    
+    # Detect OS
+    OS=$(cat /etc/os-release | grep ^ID= | cut -d= -f2 | tr -d '"')
+    echo "$(date): Detected OS: $OS"
+    
+    # Check and install required SMTP packages
+    case "$OS" in
+        ubuntu|debian)
+            if ! dpkg -l | grep -q "ssmtp"; then
+                echo "$(date): ERROR - SMTP package missing. Install it using: apt install ssmtp mailutils -y"
+                exit 1
+            fi
+            ;;
+        
+        rhel|rocky|almalinux)
+            if ! rpm -q mailx >/dev/null 2>&1; then
+                echo "$(date): ERROR - SMTP package missing. Install it using: dnf install mailx -y"
+                exit 1
+            fi
+            ;;
+        
+        sles|suse)
+            if ! rpm -q mailx >/dev/null 2>&1; then
+                echo "$(date): ERROR - SMTP package missing. Install it using: zypper install mailx -y"
+                exit 1
+            fi
+            ;;
+        
+        *)
+            echo "$(date): ERROR - Unsupported OS detected: $OS"
+            exit 1
+            ;;
+    esac
+    
+    # Ensure ADMIN_EMAIL is set
+    if [[ "$ADMIN_EMAIL" == "admin@example.com" ]]; then
+        echo "$(date): ERROR - Admin email not set. Please update ADMIN_EMAIL variable in the script."
+        exit 1
+    fi
+    
+    echo "$(date): Prerequisites verified successfully."
+}
+
+# Function to handle system updates
+updateProcess() {
+    echo "$(date): Updating system packages..."
+
+    case "$OS" in
+        ubuntu|debian)
+            apt update && apt upgrade -y
+            check_success "apt upgrade"
+            ;;
+        
+        rhel|rocky|almalinux)
+            dnf update -y
+            check_success "dnf update"
+            ;;
+        
+        sles|suse)
+            zypper refresh && zypper update -y
+            check_success "zypper update"
+            ;;
+    esac
+}
+
+# Function for cleanup after ensuring old kernels are removed
+cleanupProcess() {
+    echo "$(date): Performing cleanup..."
+
+    KERNELS_TO_KEEP=2
+    CURRENT_KERNEL=$(uname -r)
+    OLD_KERNELS=$(dpkg --list | grep linux-image | awk '{print $2}' | sort -V | sed -n "/$CURRENT_KERNEL/q" | tail -n +$((KERNELS_TO_KEEP+1)))
+
+    if [[ -n "$OLD_KERNELS" ]]; then
+        echo "$(date): Removing old kernels: $OLD_KERNELS"
+        apt-get purge -y $OLD_KERNELS
+        check_success "apt-get purge (kernel removal)"
+    else
+        echo "$(date): No old kernels to remove."
+    fi
+
+    case "$OS" in
+        ubuntu|debian)
+            apt autoremove --purge -y && apt autoclean -y
+            check_success "apt cleanup"
+            ;;
+        
+        rhel|rocky|almalinux)
+            dnf autoremove -y && dnf clean all
+            check_success "dnf cleanup"
+            ;;
+        
+        sles|suse)
+            zypper clean --all
+            check_success "zypper cleanup"
+            ;;
+    esac
+}
+
+# Function to check if a reboot is required
+rebootCheck() {
+    echo "$(date): Checking if system reboot is required..."
+
+    if [ -f /var/run/reboot-required ] || [ -f /var/run/reboot-required.pkgs ]; then
+        echo "$(date): A system reboot is required due to recent updates."
+        EMAIL_MESSAGE="System update completed successfully on $HOSTNAME, but a reboot is required.\n\nLog summary:\n$(tail -n 20 $LOG_FILE)"
+    else
+        echo "$(date): No reboot is required."
+        EMAIL_MESSAGE="System update completed successfully on $HOSTNAME. No reboot required.\n\nLog summary:\n$(tail -n 20 $LOG_FILE)"
+    fi
+
+    # Send email notification
+    echo -e "$EMAIL_MESSAGE" | mail -s "[$HOSTNAME] System Update Status" "$ADMIN_EMAIL"
+}
+
+# Run the functions in order
+prerequisiteChecks
+updateProcess
+cleanupProcess
+rebootCheck
+
+echo "$(date): System update and cleanup complete."
+exit 0
