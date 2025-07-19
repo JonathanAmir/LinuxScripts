@@ -1,0 +1,156 @@
+#!/bin/bash
+
+LOG_FILE="/var/log/dreamLog.txt"
+SITE_TOKEN="$1"
+
+# =======================
+# Logging
+# =======================
+log() {
+    local level="$1"
+    local message="$2"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $level: $message" | tee -a "$LOG_FILE"
+}
+
+# =======================
+# Pre-Checks
+# =======================
+check_root() {
+    [[ $EUID -ne 0 ]] && log "ERROR" "Script must be run as root" && exit 1
+}
+
+check_site_token() {
+    [[ -z "$SITE_TOKEN" ]] && log "ERROR" "Missing required argument: siteToken" && exit 1
+}
+
+check_architecture() {
+    [[ "$(uname -m)" != "x86_64" ]] && log "ERROR" "Unsupported architecture: $(uname -m)" && exit 1
+}
+
+# =======================
+# Detect and Validate OS
+# =======================
+detect_os() {
+    . /etc/os-release
+    OS_ID="${ID,,}"
+    OS_VERSION="${VERSION_ID%%.*}"
+    DISTRO=""
+    SUPPORTED=false
+
+    # Supported by agent 25.1.3.6 on x86_64 per SentinelOne docs
+    case "$OS_ID" in
+        ubuntu)
+            [[ "$OS_VERSION" =~ ^(14|16|18|20|22)$ ]] && DISTRO="Debian-derived" && SUPPORTED=true
+            ;;
+        debian)
+            [[ "$OS_VERSION" =~ ^(8|9|10|11)$ ]] && DISTRO="Debian-derived" && SUPPORTED=true
+            ;;
+        rhel|centos)
+            [[ "$OS_VERSION" -ge 6 && "$OS_VERSION" -le 9 ]] && DISTRO="RHEL-derived" && SUPPORTED=true
+            ;;
+        almalinux|rocky)
+            [[ "$OS_VERSION" -ge 8 && "$OS_VERSION" -le 9 ]] && DISTRO="RHEL-derived" && SUPPORTED=true
+            ;;
+    esac
+
+    if ! $SUPPORTED; then
+        log "ERROR" "Unsupported OS or version: $OS_ID $VERSION_ID"
+        exit 1
+    fi
+
+    log "INFORMATION" "Detected supported OS: $OS_ID $VERSION_ID ($DISTRO)"
+}
+
+# =======================
+# Installation Functions
+# =======================
+install_sentinelone_debian() {
+    log "INFORMATION" "Installing .deb via dpkg + apt"
+    dpkg -i ./SentinelAgent_linux_x86_64_v25_1_3_6.deb &>> "$LOG_FILE"
+    apt-get update &>> "$LOG_FILE"
+    apt-get install -f -y &>> "$LOG_FILE"
+}
+
+install_sentinelone_rhel() {
+    log "INFORMATION" "Installing .rpm via dnf or yum"
+    if command -v dnf &>/dev/null; then
+        dnf install -y ./SentinelAgent_linux_x86_64_v25_1_3_6.rpm &>> "$LOG_FILE"
+    elif command -v yum &>/dev/null; then
+        yum install -y ./SentinelAgent_linux_x86_64_v25_1_3_6.rpm &>> "$LOG_FILE"
+    else
+        log "ERROR" "No supported package manager found"
+        exit 1
+    fi
+}
+
+install_sentinelone() {
+    case "$DISTRO" in
+        Debian-derived) install_sentinelone_debian ;;
+        RHEL-derived) install_sentinelone_rhel ;;
+    esac
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Installation failed"
+        exit 1
+    fi
+    log "INFORMATION" "Installation completed"
+}
+
+# =======================
+# Agent Configuration
+# =======================
+configure_and_start_agent() {
+    /opt/sentinelone/bin/sentinelctl management token set "$SITE_TOKEN" &>> "$LOG_FILE"
+    sleep 2
+    /opt/sentinelone/bin/sentinelctl control start &>> "$LOG_FILE"
+}
+
+verify_agent_status() {
+    for attempt in {1..3}; do
+        sleep 2
+        STATUS=$(/opt/sentinelone/bin/sentinelctl control status 2>> "$LOG_FILE")
+        echo "$STATUS" | tee -a "$LOG_FILE" | grep -q "Enabled"
+        if [[ $? -eq 0 ]]; then
+            log "INFORMATION" "SentinelOne status Enabled (attempt $attempt)"
+            return 0
+        else
+            log "WARNING" "Status not enabled yet (attempt $attempt)"
+        fi
+    done
+    log "ERROR" "SentinelOne failed to start after 3 attempts"
+    exit 1
+}
+
+# =======================
+# Anti-Tampering Protection
+# =======================
+enable_protection() {
+    # Official method: sentinelctl protect per SentinelOne docs :contentReference[oaicite:6]{index=6}
+    /opt/sentinelone/bin/sentinelctl protect &>> "$LOG_FILE"
+    if [[ $? -eq 0 ]]; then
+        log "INFORMATION" "Anti-tampering protection enabled"
+    else
+        log "ERROR" "Failed to enable anti-tampering protection"
+        exit 1
+    fi
+}
+
+# =======================
+# Main Flow
+# =======================
+main() {
+    touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+
+    check_root
+    check_site_token
+    check_architecture
+    detect_os
+    install_sentinelone
+    configure_and_start_agent
+    verify_agent_status
+    enable_protection
+
+    log "INFORMATION" "SentinelOne installation, activation, and protection completed successfully"
+}
+
+main "$@"
